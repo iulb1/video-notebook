@@ -196,6 +196,7 @@ header p{font-size:13px;color:#888;margin-top:4px}
         <label><input type="checkbox" id="skipProcessed" checked> 跳过已处理文件</label>
         <label><input type="checkbox" id="saveKeyframes" checked> 提取关键帧截图</label>
         <label><input type="checkbox" id="trashSource" checked> 处理后移入回收站</label>
+        <label><input type="checkbox" id="vadFilter" title="跳过长静音段以加速转写，可能误删低音量语音，适合讲课/会议录音"> VAD 静音过滤</label>
       </div>
     </div>
   </div>
@@ -326,6 +327,7 @@ function getConfig(){
     fmt_srt: document.getElementById('fmtSrt').checked,
     fmt_docx: document.getElementById('fmtDocx').checked,
     trash_source: document.getElementById('trashSource').checked,
+    vad_filter: document.getElementById('vadFilter').checked,
   };
 }
 

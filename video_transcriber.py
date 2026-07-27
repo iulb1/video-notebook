@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import functools
 import gc
 import hashlib
 import json
@@ -63,13 +64,7 @@ if sys.platform == "win32":
     def move_to_trash(path: str) -> bool:
         """将文件或目录送回收站。"""
         buf = ctypes.c_wchar_p(path + "\0\0")
-        op = (ctypes.c_ushort * 7)(
-            ctypes.c_ushort(0),          # hwnd
-            ctypes.c_ushort(FO_DELETE),   # wFunc
-            ctypes.sizeof(buf) // 2,      # pFrom 是 buf 地址低16位
-            # 实际上我们应该用 SHFILEOPSTRUCTW
-        )
-        # 直接用 SHFILEOPSTRUCTW 更可靠
+
         class SHFILEOPSTRUCTW(ctypes.Structure):
             _fields_ = [
                 ("hwnd", wintypes.HWND),
@@ -107,8 +102,6 @@ try:
 except ImportError:
     WhisperModel = None
 
-from tqdm import tqdm
-
 
 class VideoProcessingError(Exception):
     """视频处理阶段的通用异常。"""
@@ -130,6 +123,14 @@ SegmentDict = dict[str, float | str]
 TranscriptionMetadata = dict[str, str | float | int | None]
 
 
+def safe_name(path: Path) -> str:
+    """安全获取文件名，避免 Windows 中文路径下的编码异常。"""
+    try:
+        return os.fsdecode(path.name)
+    except Exception:
+        return str(path.name)
+
+
 def get_keyframe_threshold(frequency: str) -> float:
     """根据截图频率名称返回对应的帧差阈值。"""
     mapping = {
@@ -143,6 +144,10 @@ def get_keyframe_threshold(frequency: str) -> float:
 
 
 class VideoTranscriber:
+    # 支持的媒体扩展名（类常量，避免每次实例化都重建集合）
+    VIDEO_EXTENSIONS = frozenset({".mp4", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".webm", ".ts"})
+    AUDIO_EXTENSIONS = frozenset({".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma"})
+
     def __init__(
         self,
         model_size: str = "faster-whisper-small",
@@ -154,6 +159,7 @@ class VideoTranscriber:
         exporter: object | None = None,
         output_formats: set[str] | None = None,
         trash_source: bool = True,
+        vad_filter: bool = False,
         logger: logging.Logger | None = None,
         stop_event: threading.Event | None = None,
     ) -> None:
@@ -163,10 +169,12 @@ class VideoTranscriber:
         Args:
             model_size: ASR 模型名称 (默认为 ParakeetTDT-0.6B-v3)
             device: 计算设备 (cuda 或 cpu)
+            vad_filter: 是否开启 VAD 静音过滤（长静音视频可加速，但可能误删低音量语音）
             stop_event: 停止信号事件
         """
         self.logger = logger or logging.getLogger(__name__)
         self.stop_event = stop_event
+        self.vad_filter = vad_filter
         self.language = None if language in (None, "", "auto") else language
         self.save_keyframes = save_keyframes
         self.keyframe_threshold = keyframe_threshold
@@ -210,10 +218,10 @@ class VideoTranscriber:
                 raise VideoProcessingError(f"模型初始化失败: {exc}") from exc
         
         self.logger.info("模型加载完成")
-        self.video_extensions = {".mp4", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".webm", ".ts"}
-        self.audio_extensions = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma"}
+        # video_extensions / audio_extensions 已提为类常量 VIDEO_EXTENSIONS / AUDIO_EXTENSIONS
 
     @staticmethod
+    @functools.lru_cache(maxsize=8)
     def resolve_ffmpeg_path_static(ffmpeg_path: str | None = None) -> str:
         candidates = [
             ffmpeg_path,
@@ -277,11 +285,6 @@ class VideoTranscriber:
         if self.stop_event and self.stop_event.is_set():
             raise VideoProcessingError("Processing stopped by user.")
 
-    def should_use_tqdm(self) -> bool:
-        """仅在可写控制台存在时启用 tqdm。"""
-        stream = sys.stderr
-        return bool(stream and hasattr(stream, "write") and hasattr(stream, "isatty") and stream.isatty())
-
     def deduplicate_repeated_text(self, text: str) -> str:
         """清理连续重复的短语，降低口吃式重复输出。"""
         normalized = " ".join(text.split())
@@ -335,10 +338,10 @@ class VideoTranscriber:
         return deduplicated
     
     def is_video_file(self, path: Path) -> bool:
-        return path.suffix.lower() in self.video_extensions
+        return path.suffix.lower() in self.VIDEO_EXTENSIONS
 
     def is_audio_file(self, path: Path) -> bool:
-        return path.suffix.lower() in self.audio_extensions
+        return path.suffix.lower() in self.AUDIO_EXTENSIONS
 
     def scan_media(self, input_dir: str) -> list[Path]:
         """
@@ -366,11 +369,7 @@ class VideoTranscriber:
                 ext = file_path.suffix.lower()
                 all_extensions.add(ext)
                 if self.is_video_file(file_path) or self.is_audio_file(file_path):
-                    try:
-                        file_name = os.fsdecode(file_path.name)
-                    except:
-                        file_name = str(file_path.name)
-                    self.logger.info(f"  发现媒体文件: {file_name} ({ext})")
+                    self.logger.info(f"  发现媒体文件: {safe_name(file_path)} ({ext})")
                     media_files.append(file_path)
         except Exception as e:
             self.logger.error(f"  目录扫描异常: {e}")
@@ -393,11 +392,7 @@ class VideoTranscriber:
             self.ensure_not_stopped()
             time.sleep(0.1)
             video_path_str = str(video_path)
-            video_name = "未知文件"
-            try:
-                video_name = os.fsdecode(video_path.name)
-            except:
-                pass
+            video_name = safe_name(video_path)
             self.logger.info(f"  使用 ffmpeg 提取音频: {video_name}")
 
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
@@ -451,11 +446,7 @@ class VideoTranscriber:
             raise
         except Exception as exc:
             # 简化错误消息，避免编码问题
-            video_name = "未知文件"
-            try:
-                video_name = os.fsdecode(video_path.name)
-            except:
-                pass
+            video_name = safe_name(video_path)
             raise AudioExtractionError(f"音频提取失败: {video_name}") from exc
 
     def transcribe_audio(
@@ -503,6 +494,7 @@ class VideoTranscriber:
                         language=self.requested_language(),
                         beam_size=3,
                         word_timestamps=False,
+                        vad_filter=self.vad_filter,
                     )
                     
                     if i == 0:
@@ -523,6 +515,7 @@ class VideoTranscriber:
                     language=self.requested_language(),
                     beam_size=3,
                     word_timestamps=False,
+                    vad_filter=self.vad_filter,
                 )
                 raw_results = []
                 for segment in segments:
@@ -587,26 +580,28 @@ class VideoTranscriber:
             merged.append(current)
         return merged
 
-    def _extract_all_frames(
-        self, video_path: Path, fps: float, output_dir: Path
-    ) -> list[tuple[float, Path]]:
-        """单次 ffmpeg 解码，按 fps 抽帧到 output_dir，返回 [(时间戳, 路径)]。"""
-        cmd = [
-            self.ffmpeg_path, "-y", "-i", str(video_path),
-            "-vf", f"fps={fps}", "-q:v", "2",
-            str(output_dir / "frame_%09d.jpg"),
-        ]
-        result = subprocess.run(cmd, capture_output=True, timeout=3600,
-                                creationflags=NO_WINDOW)
-        if result.returncode != 0:
-            err = result.stderr.decode("utf-8", errors="ignore").strip()
-            raise VideoProcessingError(f"ffmpeg 抽帧失败: {err}")
+    def _extract_frame_at(self, video_path: Path, timestamp: float, output_path: Path) -> bool:
+        """用 ffmpeg -ss 精准 seek 抽取指定时间点的一帧，返回是否成功。
 
-        frames: list[tuple[float, Path]] = []
-        for fp in sorted(output_dir.glob("frame_*.jpg")):
-            idx = int(fp.stem.split("_")[1])
-            frames.append((idx / fps, fp))
-        return frames
+        相比全量按 fps 抽帧，这种按需 seek 的方式只生成真正需要的少量帧，
+        长视频下可从分钟级降到秒级，且磁盘 IO 大幅减少。
+        -ss 放在 -i 之前使用 input seek（快速跳转到最近关键帧）。
+        """
+        cmd = [
+            self.ffmpeg_path, "-y",
+            "-ss", f"{timestamp:.3f}",
+            "-i", str(video_path),
+            "-frames:v", "1",
+            "-q:v", "2",
+            str(output_path),
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, timeout=60, creationflags=NO_WINDOW
+            )
+        except subprocess.TimeoutExpired:
+            return False
+        return result.returncode == 0 and output_path.exists()
 
     def extract_note_keyframes(
         self,
@@ -632,34 +627,33 @@ class VideoTranscriber:
 
         temp_dir: Path | None = None
         try:
-            # ── 第 1 步：单次 ffmpeg 抽帧 ──
+            # ── 第 1 步：按候选时间戳用 ffmpeg -ss 精准 seek 抽帧 ──
+            # （取代原来 fps=2 全量抽帧，长视频下大幅减少 IO 和耗时）
             temp_dir = Path(tempfile.gettempdir()) / f"kf_{os.getpid()}"
             temp_dir.mkdir(parents=True, exist_ok=True)
 
-            fps = 2
-            all_frames = self._extract_all_frames(video_path, fps, temp_dir)
-            if not all_frames:
-                return enriched_blocks
-
-            # ── 第 2 步：每 10 分钟段均匀选 8 张候选 ──
             seg_duration = 600
             num_segs = max(1, int(video_duration) // seg_duration + 1)
             target_per_seg = 8
 
             candidates: list[tuple[float, Path]] = []
+            frame_idx = 0
             for seg_idx in range(num_segs):
                 start = seg_idx * seg_duration
                 end = min(start + seg_duration, video_duration)
-                seg_frames = [(t, p) for t, p in all_frames if start <= t < end]
-                if not seg_frames:
+                if end <= start:
                     continue
-                step = max(1, len(seg_frames) / target_per_seg)
                 for i in range(target_per_seg):
-                    idx = min(int(i * step), len(seg_frames) - 1)
-                    candidates.append(seg_frames[idx])
+                    # 在每段内均匀取 target_per_seg 个时间点（中点采样）
+                    ts = start + (end - start) * (i + 0.5) / target_per_seg
+                    out_frame = temp_dir / f"frame_{frame_idx:06d}.jpg"
+                    frame_idx += 1
+                    if self._extract_frame_at(video_path, ts, out_frame):
+                        candidates.append((ts, out_frame))
 
+            total_extracted = len(candidates)
             if not candidates:
-                candidates = all_frames[:1]
+                return enriched_blocks
 
             # ── 第 3 步：帧差去重 ──
             prev_arr = None
@@ -708,8 +702,8 @@ class VideoTranscriber:
                 ).replace("\\", "/")
                 assigned += 1
 
-            self.logger.info("  关键帧: 抽 %d 帧 → 候选 %d → 去重 %d → 分配到 %d 个笔记块",
-                             len(all_frames), len(candidates), len(deduped), assigned)
+            self.logger.info("  关键帧: seek 抽 %d 帧 → 去重 %d → 分配到 %d 个笔记块",
+                             total_extracted, len(deduped), assigned)
 
         except Exception as exc:
             self.logger.warning("关键帧提取失败: %s", exc)
@@ -894,24 +888,19 @@ class VideoTranscriber:
             处理成功返回 True，失败返回 False
         """
         # 安全处理媒体文件名，避免编码错误
-        media_name = "未知文件"
-        try:
-            media_name = os.fsdecode(media_path.name)
-        except:
-            pass
-        
+        media_name = safe_name(media_path)
+
         # 检查是否已处理
         if skip_processed and self.is_already_processed(media_path, output_dir):
             self.logger.info("[跳过] %s (已处理)", media_name)
             return True
 
         self.logger.info("[处理] %s", media_name)
+        # 提前记录原始值，确保 finally 块中一定能访问到（避免 NameError）
+        original_save_keyframes = self.save_keyframes
         try:
             if self.is_audio_file(media_path):
-                original_save_keyframes = self.save_keyframes
                 self.save_keyframes = False
-            else:
-                original_save_keyframes = self.save_keyframes
 
             audio = self.extract_audio(media_path)
             results, metadata = self.transcribe_audio(audio, media_name)
@@ -925,10 +914,9 @@ class VideoTranscriber:
                 self.logger.warning("[警告] 转写结果为空: %s", media_name)
 
             # 安全处理输出文件名，避免编码错误
-            output_stem = ""
             try:
                 output_stem = os.fsdecode(media_path.stem)
-            except:
+            except Exception:
                 import hashlib
                 output_stem = hashlib.md5(str(media_path).encode('utf-8', errors='ignore')).hexdigest()
             

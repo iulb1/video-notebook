@@ -25,6 +25,10 @@ stop_event = threading.Event()
 log_queue: queue.Queue[str] = queue.Queue()
 processing = False
 
+# 保护 task_queue / processing / _task_id_counter / progress 的并发访问
+# （app.run(threaded=True) 下多个请求线程会同时读写这些全局变量）
+_state_lock = threading.Lock()
+
 # 全局复用的转写器实例，避免每次队列处理都重新加载/销毁模型。
 # 关键：faster-whisper 模型在析构时会访问 CUDA 资源，可能触发段错误
 # 导致整个进程退出（faulthandler 检测到后直接终止）。保留全局引用可避免析构。
@@ -78,12 +82,12 @@ threading.excepthook = _log_thread_exception
 
 
 def progress_callback(current: int, total: int, file_name: str):
-    global progress
-    progress["current_file"] = file_name
-    progress["total"] = total
-    progress["completed"] = current
-    if progress.get("queue_total", 0) == 0:
-        progress["percentage"] = int(current / total * 100) if total > 0 else 0
+    with _state_lock:
+        progress["current_file"] = file_name
+        progress["total"] = total
+        progress["completed"] = current
+        if progress.get("queue_total", 0) == 0:
+            progress["percentage"] = int(current / total * 100) if total > 0 else 0
 
 
 def build_config(data: dict) -> dict:
@@ -99,8 +103,9 @@ def build_config(data: dict) -> dict:
         "fmt_md": data.get("fmt_md", True),
         "fmt_json": data.get("fmt_json", False),
         "fmt_srt": data.get("fmt_srt", False),
-        "fmt_docx": data.get("fmt_docx", True),
+        "fmt_docx": data.get("fmt_docx", False),
         "trash_source": data.get("trash_source", True),
+        "vad_filter": data.get("vad_filter", False),
     }
 
 
@@ -139,7 +144,8 @@ def queue_worker():
         _queue_log.write_text("")
         _dump_queue_state()
 
-        first = next((t for t in task_queue if t["status"] == "pending"), None)
+        with _state_lock:
+            first = next((t for t in task_queue if t["status"] == "pending"), None)
         if first is None:
             return
         cfg = first["config"]
@@ -175,6 +181,7 @@ def queue_worker():
                 effective_formats.add("md")
             tr.output_formats = effective_formats
             tr.trash_source = cfg.get("trash_source", False)
+            tr.vad_filter = cfg.get("vad_filter", False)
             web_logger.info("复用已有的转写模型实例 (device=%s)", _worker_device)
         else:
             tr = VideoTranscriber(
@@ -187,6 +194,7 @@ def queue_worker():
                 exporter=exporter,
                 output_formats=formats,
                 trash_source=cfg.get("trash_source", False),
+                vad_filter=cfg.get("vad_filter", False),
                 logger=web_logger,
                 stop_event=stop_event,
             )
@@ -194,32 +202,34 @@ def queue_worker():
             _worker_device = tr.device
             web_logger.info("创建新的转写模型实例 (device=%s)", _worker_device)
 
-        pending_count = sum(1 for t in task_queue if t["status"] == "pending")
-        progress["queue_total"] = pending_count
-        progress["queue_completed"] = 0
-        progress["percentage"] = 0
+        with _state_lock:
+            pending_count = sum(1 for t in task_queue if t["status"] == "pending")
+            progress["queue_total"] = pending_count
+            progress["queue_completed"] = 0
+            progress["percentage"] = 0
 
         while True:
-            pending = [t for t in task_queue if t["status"] == "pending"]
-            if not pending:
-                break
-            item = pending[0]
-            item["status"] = "running"
-            progress["status"] = "running"
+            with _state_lock:
+                pending = [t for t in task_queue if t["status"] == "pending"]
+                if not pending:
+                    break
+                item = pending[0]
+                item["status"] = "running"
+                progress["status"] = "running"
+                progress["current_file"] = Path(item["input"]).name
+                progress["total"] = 0
+                progress["completed"] = 0
             _dump_queue_state()
             web_logger.info("[队列] 开始处理 #%d: %s", item["id"], item["input"])
 
-            progress["current_file"] = Path(item["input"]).name
-            progress["total"] = 0
-            progress["completed"] = 0
-
             result = _run_single(tr, item["config"])
             web_logger.info("[队列] #%d 处理完毕: %s", item["id"], result)
-            item["status"] = result
 
-            progress["queue_completed"] += 1
-            if progress["queue_total"] > 0:
-                progress["percentage"] = int(progress["queue_completed"] / progress["queue_total"] * 100)
+            with _state_lock:
+                item["status"] = result
+                progress["queue_completed"] += 1
+                if progress["queue_total"] > 0:
+                    progress["percentage"] = int(progress["queue_completed"] / progress["queue_total"] * 100)
             _dump_queue_state()
     except Exception as exc:
         web_logger.error("队列 worker 异常: %s", exc)
@@ -229,10 +239,11 @@ def queue_worker():
         # 这两个操作可能触发 C 扩展级别的段错误（faster-whisper 模型析构
         # 时访问 CUDA 资源），faulthandler 会使整个进程直接退出。
         # 让 Python GC 在后台自然回收即可。
-        processing = False
-        if progress["status"] != "stopped":
-            progress["status"] = "completed"
-            progress["percentage"] = 100
+        with _state_lock:
+            processing = False
+            if progress["status"] != "stopped":
+                progress["status"] = "completed"
+                progress["percentage"] = 100
         web_logger.info("队列处理完毕")
         _dump_queue_state()
 
@@ -267,38 +278,41 @@ def api_start():
     config = build_config(data)
     config["output"] = output_path
 
-    _task_id_counter += 1
-    item = {
-        "id": _task_id_counter,
-        "input": input_path,
-        "config": config,
-        "status": "pending",
-    }
-    task_queue.append(item)
+    with _state_lock:
+        _task_id_counter += 1
+        item = {
+            "id": _task_id_counter,
+            "input": input_path,
+            "config": config,
+            "status": "pending",
+        }
+        task_queue.append(item)
+        queue_size = len(task_queue)
 
     web_logger.info("已加入队列 [#%d] %s", item["id"], input_path)
-    return jsonify({"status": "queued", "id": item["id"], "queue_size": len(task_queue)})
+    return jsonify({"status": "queued", "id": item["id"], "queue_size": queue_size})
 
 
 @app.route("/api/queue/start", methods=["POST"])
 def api_queue_start():
     global processing, worker_thread, stop_event
 
-    pending = [t for t in task_queue if t["status"] == "pending"]
-    if not pending:
-        return jsonify({"error": "队列为空"}), 400
+    with _state_lock:
+        pending = [t for t in task_queue if t["status"] == "pending"]
+        pending_count = len(pending)
+        if not pending:
+            return jsonify({"error": "队列为空"}), 400
 
-    if processing:
-        return jsonify({"error": "队列已在运行"}), 400
+        if processing:
+            return jsonify({"error": "队列已在运行"}), 400
 
-    processing = True
-    stop_event.clear()
-    progress["status"] = "running"
-
-    progress["current_file"] = ""
-    progress["total"] = len(pending)
-    progress["completed"] = 0
-    progress["percentage"] = 0
+        processing = True
+        stop_event.clear()
+        progress["status"] = "running"
+        progress["current_file"] = ""
+        progress["total"] = pending_count
+        progress["completed"] = 0
+        progress["percentage"] = 0
 
     while not log_queue.empty():
         log_queue.get()
@@ -306,31 +320,32 @@ def api_queue_start():
     worker_thread = threading.Thread(target=queue_worker, daemon=True)
     worker_thread.start()
 
-    return jsonify({"status": "started", "queue_size": len(pending)})
+    return jsonify({"status": "started", "queue_size": pending_count})
 
 
 @app.route("/api/queue")
 def api_queue():
-    total = len(task_queue)
-    completed_count = sum(1 for t in task_queue if t["status"] == "completed")
-    running = processing or any(t["status"] == "running" for t in task_queue)
-
-    items = []
-    for t in task_queue:
-        name = Path(t["input"]).name if t["input"] else t["input"]
-        items.append({
-            "id": t["id"],
-            "input": t["input"],
-            "name": name,
-            "status": t["status"],
-        })
+    with _state_lock:
+        items = []
+        for t in task_queue:
+            name = Path(t["input"]).name if t["input"] else t["input"]
+            items.append({
+                "id": t["id"],
+                "input": t["input"],
+                "name": name,
+                "status": t["status"],
+            })
+        total = len(task_queue)
+        completed_count = sum(1 for t in task_queue if t["status"] == "completed")
+        running = processing or any(t["status"] == "running" for t in task_queue)
+        is_processing = processing
 
     return jsonify({
         "items": items,
         "total": total,
         "completed": completed_count,
         "running": running,
-        "processing": processing,
+        "processing": is_processing,
     })
 
 
@@ -341,20 +356,22 @@ def api_queue_remove():
     if not item_id:
         return jsonify({"error": "缺少 id"}), 400
 
-    global task_queue
-    target = None
-    for t in task_queue:
-        if t["id"] == item_id:
-            target = t
-            break
+    with _state_lock:
+        target = None
+        for t in task_queue:
+            if t["id"] == item_id:
+                target = t
+                break
 
-    if target is None:
-        return jsonify({"error": "未找到该任务"}), 404
+        if target is None:
+            return jsonify({"error": "未找到该任务"}), 404
 
-    if target["status"] == "running":
-        return jsonify({"error": "不能移除正在运行的任务"}), 400
+        if target["status"] == "running":
+            return jsonify({"error": "不能移除正在运行的任务"}), 400
 
-    task_queue = [t for t in task_queue if t["id"] != item_id]
+        # 原地移除，避免 global task_queue 重建导致的引用竞争
+        task_queue[:] = [t for t in task_queue if t["id"] != item_id]
+
     web_logger.info("已移除队列项 [#%d]", item_id)
     return jsonify({"status": "removed"})
 
@@ -389,6 +406,8 @@ def api_batch_enqueue():
 
     added: list[dict] = []
     errors: list[dict] = []
+    # 先在锁外做存在性校验和配置构建（涉及 IO，不要持锁）
+    prepared: list[tuple[dict, str]] = []
     for entry in items:
         input_path = (entry.get("input") or "").strip()
         if not input_path or not os.path.exists(input_path):
@@ -400,16 +419,19 @@ def api_batch_enqueue():
         if not output_path:
             output_path = input_path
         cfg["output"] = output_path
+        prepared.append((cfg, input_path))
 
-        _task_id_counter += 1
-        item = {
-            "id": _task_id_counter,
-            "input": input_path,
-            "config": cfg,
-            "status": "pending",
-        }
-        task_queue.append(item)
-        added.append({"id": item["id"], "input": input_path})
+    with _state_lock:
+        for cfg, input_path in prepared:
+            _task_id_counter += 1
+            item = {
+                "id": _task_id_counter,
+                "input": input_path,
+                "config": cfg,
+                "status": "pending",
+            }
+            task_queue.append(item)
+            added.append({"id": item["id"], "input": input_path})
 
     web_logger.info("批量入队: 成功 %d 项, 失败 %d 项", len(added), len(errors))
     return jsonify({"added": added, "errors": errors})
@@ -427,15 +449,16 @@ def api_ffmpeg_path():
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
     global processing, progress
-    if processing:
-        stop_event.set()
-        processing = False
-        progress["status"] = "stopped"
+    with _state_lock:
+        if processing:
+            stop_event.set()
+            processing = False
+            progress["status"] = "stopped"
 
-    for t in task_queue:
-        if t["status"] == "running":
-            t["status"] = "stopped"
-            break
+        for t in task_queue:
+            if t["status"] == "running":
+                t["status"] = "stopped"
+                break
 
     return jsonify({"status": "stopped"})
 
@@ -450,26 +473,28 @@ def api_logs():
         except queue.Empty:
             break
 
-    if processing and worker_thread and not worker_thread.is_alive():
-        processing = False
-        if progress["status"] == "running":
-            progress["status"] = "completed"
-            progress["percentage"] = 100
+    with _state_lock:
+        if processing and worker_thread and not worker_thread.is_alive():
+            processing = False
+            if progress["status"] == "running":
+                progress["status"] = "completed"
+                progress["percentage"] = 100
 
-    total_queue = progress.get("queue_total", 0) or len(task_queue)
-    completed_queue = progress.get("queue_completed", 0) or sum(1 for t in task_queue if t["status"] == "completed")
+        total_queue = progress.get("queue_total", 0) or len(task_queue)
+        completed_queue = progress.get("queue_completed", 0) or sum(1 for t in task_queue if t["status"] == "completed")
+        resp = {
+            "logs": logs,
+            "processing": processing,
+            "status": progress.get("status", "idle"),
+            "current_file": progress.get("current_file", ""),
+            "total": progress.get("total", 0),
+            "completed": progress.get("completed", 0),
+            "percentage": progress.get("percentage", 0),
+            "queue_total": total_queue,
+            "queue_completed": completed_queue,
+        }
 
-    return jsonify({
-        "logs": logs,
-        "processing": processing,
-        "status": progress.get("status", "idle"),
-        "current_file": progress.get("current_file", ""),
-        "total": progress.get("total", 0),
-        "completed": progress.get("completed", 0),
-        "percentage": progress.get("percentage", 0),
-        "queue_total": total_queue,
-        "queue_completed": completed_queue,
-    })
+    return jsonify(resp)
 
 
 def main():
