@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>音视频字幕转录工具</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f2f5;color:#1a1a2e;padding:20px;min-height:100vh}
+.container{max-width:860px;margin:0 auto}
+header{text-align:center;padding:20px 0 16px}
+header h1{font-size:22px;font-weight:700;color:#1a73e8;letter-spacing:.5px}
+header p{font-size:13px;color:#888;margin-top:4px}
+
+.card{background:#fff;border-radius:12px;box-shadow:0 1px 4px rgba(0,0,0,.06);padding:20px 24px;margin-bottom:14px}
+.card-title{font-size:14px;font-weight:600;color:#444;margin-bottom:14px;display:flex;align-items:center;gap:6px}
+
+.path-group{gap:12px}
+.path-row{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.path-row label{font-size:13px;color:#666;width:70px;flex-shrink:0;font-weight:500}
+.path-input-wrap{flex:1;display:flex;gap:6px}
+.path-input-wrap input{flex:1;padding:8px 12px;border:1.5px solid #e0e0e0;border-radius:8px;font-size:13px;outline:none;transition:border .2s,box-shadow .2s;background:#fafafa}
+.path-input-wrap input:focus{border-color:#1a73e8;box-shadow:0 0 0 3px rgba(26,115,232,.1);background:#fff}
+.path-input-wrap input::placeholder{color:#bbb}
+.btn-browse{padding:8px 16px;background:#e8f0fe;border:1px solid #d2e3fc;border-radius:8px;cursor:pointer;font-size:13px;color:#1a73e8;font-weight:500;white-space:nowrap;transition:all .15s}
+.btn-browse:hover{background:#d2e3fc}
+
+.settings-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:12px}
+.settings-grid .field label{display:block;font-size:12px;color:#888;margin-bottom:4px;font-weight:500}
+.settings-grid .field select,.settings-grid .field input{padding:7px 10px;border:1.5px solid #e0e0e0;border-radius:8px;font-size:13px;outline:none;width:100%;background:#fafafa;transition:border .2s}
+.settings-grid .field select:focus,.settings-grid .field input:focus{border-color:#1a73e8;background:#fff}
+
+.format-group{display:flex;gap:18px;flex-wrap:wrap;padding:4px 0}
+.format-group label{display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;color:#555}
+.format-group input[type=checkbox]{accent-color:#1a73e8;width:15px;height:15px}
+
+.extra-opts{display:flex;gap:20px;flex-wrap:wrap;padding:4px 0;margin-top:2px}
+.extra-opts label{display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;color:#555}
+.extra-opts input[type=checkbox]{accent-color:#1a73e8;width:15px;height:15px}
+
+.actions{display:flex;gap:12px;justify-content:center;padding:4px 0}
+.btn{padding:10px 36px;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;transition:all .2s;display:inline-flex;align-items:center;gap:6px}
+.btn-primary{background:#1a73e8;color:#fff}
+.btn-primary:hover{background:#1557b0;transform:translateY(-1px);box-shadow:0 4px 12px rgba(26,115,232,.3)}
+.btn-primary:disabled{background:#93b8f0;transform:none;box-shadow:none;cursor:not-allowed}
+.btn-danger{background:#e8453c;color:#fff}
+.btn-danger:hover{background:#c62828;transform:translateY(-1px)}
+.btn-danger:disabled{background:#f0a39e;transform:none;cursor:not-allowed}
+.btn-outline{background:transparent;border:1.5px solid #ddd;color:#666}
+.btn-outline:hover{background:#f5f5f5;border-color:#bbb}
+.btn-success{background:#0d7c3f;color:#fff}
+.btn-success:hover{background:#0a6332;transform:translateY(-1px);box-shadow:0 4px 12px rgba(13,124,63,.3)}
+.btn-success:disabled{background:#7fba97;transform:none;box-shadow:none;cursor:not-allowed}
+
+.progress-section{margin-top:4px}
+.progress-info{display:flex;justify-content:space-between;align-items:center;font-size:13px;color:#555;margin-bottom:6px}
+.progress-file{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#1a73e8;font-weight:500}
+.progress-pct{font-weight:600;color:#333;min-width:44px;text-align:right}
+.progress-bar-bg{width:100%;height:8px;background:#e0e0e0;border-radius:4px;overflow:hidden}
+.progress-bar-fill{height:100%;background:linear-gradient(90deg,#1a73e8,#4fc3f7);border-radius:4px;transition:width .3s ease;width:0%}
+
+.log-box{background:#1a1a2e;color:#cdd6f4;border-radius:10px;padding:14px;height:300px;overflow-y:auto;font-family:"Cascadia Code","Fira Code","JetBrains Mono",monospace;font-size:12.5px;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+.log-box .info{color:#89b4fa}
+.log-box .warn{color:#f9e2af}
+.log-box .error{color:#f38ba8}
+.log-box .success{color:#a6e3a1}
+.log-box .dim{color:#585b70}
+
+.status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;flex-shrink:0}
+.status-dot.idle{background:#9e9e9e}
+.status-dot.running{background:#4caf50;animation:pulse 1s ease-in-out infinite}
+.status-dot.done{background:#4caf50}
+.status-dot.failed{background:#f44336}
+.status-dot.stopped{background:#ff9800}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+.badge{display:inline-block;padding:2px 10px;border-radius:10px;font-size:11px;font-weight:600}
+.badge-idle{background:#e0e0e0;color:#666}
+.badge-running{background:#e3f2fd;color:#1565c0}
+.badge-done{background:#e8f5e9;color:#2e7d32}
+.badge-failed{background:#fbe9e7;color:#c62828}
+.badge-stopped{background:#fff3e0;color:#e65100}
+
+.status-bar{display:flex;align-items:center;gap:10px;font-size:13px}
+.status-bar .status-text{display:flex;align-items:center}
+
+/* queue */
+.queue-list{list-style:none;padding:0}
+.queue-item{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #f0f0f0;font-size:13px}
+.queue-item:last-child{border-bottom:none}
+.queue-item .q-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#333}
+.queue-item .q-idx{color:#999;font-size:12px;min-width:20px}
+.queue-item .q-status{min-width:60px;text-align:center}
+.queue-item .q-remove{background:none;border:none;color:#ccc;cursor:pointer;font-size:16px;padding:0 4px;line-height:1}
+.queue-item .q-remove:hover{color:#e8453c}
+.queue-item.running{background:#f0f7ff;border-radius:6px;margin:0 -8px;padding:8px}
+.queue-empty{color:#999;font-size:13px;text-align:center;padding:16px 0}
+
+/* modal */
+.modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.4);z-index:1000;justify-content:center;align-items:center}
+.modal-overlay.active{display:flex}
+.modal{background:#fff;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.2);width:560px;max-width:94vw;max-height:80vh;display:flex;flex-direction:column}
+.modal-header{padding:16px 20px;border-bottom:1px solid #eee;display:flex;justify-content:space-between;align-items:center;font-size:15px;font-weight:600}
+.modal-header .close{background:none;border:none;font-size:22px;color:#999;cursor:pointer;padding:0 4px;line-height:1}
+.modal-header .close:hover{color:#333}
+.modal-body{flex:1;overflow-y:auto;padding:8px 0}
+.modal-footer{padding:12px 20px;border-top:1px solid #eee;display:flex;gap:10px;justify-content:flex-end}
+.modal-footer .btn{padding:8px 24px;font-size:13px}
+.modal-subdir-item{display:flex;align-items:center;gap:10px;padding:8px 20px;font-size:13px;cursor:pointer;transition:background .1s}
+.modal-subdir-item:hover{background:#f5f7fa}
+.modal-subdir-item input[type=checkbox]{accent-color:#1a73e8;width:15px;height:15px}
+.modal-subdir-item .ms-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#333}
+.modal-subdir-item .ms-path{font-size:11px;color:#999;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.modal-select-all{padding:8px 20px 4px;font-size:12px;color:#666;display:flex;align-items:center;gap:8px;cursor:pointer}
+.modal-select-all input[type=checkbox]{accent-color:#1a73e8;width:14px;height:14px}
+
+@media(max-width:600px){
+  body{padding:12px}
+  .card{padding:16px}
+  .path-row{flex-direction:column;align-items:stretch}
+  .path-row label{width:auto}
+  .settings-grid{grid-template-columns:1fr 1fr}
+  .actions{flex-wrap:wrap}
+  .actions .btn{flex:1;min-width:120px;justify-content:center}
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <h1>&#127916; 音视频字幕转录工具</h1>
+  <p>基于 Faster Whisper 的本地语音转文字工具</p>
+</header>
+
+<div class="card">
+  <div class="card-title">&#128193; 文件路径</div>
+  <div class="path-group">
+    <div class="path-row">
+      <label>输入路径</label>
+      <div class="path-input-wrap">
+        <input type="text" id="inputPath" placeholder="选择视频文件或文件夹..." spellcheck="false">
+        <button class="btn-browse" onclick="browseFile()">&#128193; 选文件</button>
+        <button class="btn-browse" onclick="browseFolder()">&#128193; 选文件夹</button>
+        <button class="btn-browse" onclick="browseBatch()" title="批量添加子文件夹">&#128203; 批量加</button>
+      </div>
+    </div>
+    <div class="path-row">
+      <label>输出目录</label>
+      <div class="path-input-wrap">
+        <input type="text" id="outputPath" placeholder="默认: 与输入路径相同" spellcheck="false">
+        <button class="btn-browse" onclick="browseOutput()">&#128193; 选择</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title" style="cursor:pointer" onclick="toggleSettings()">&#9881;&#65039; 转写设置 <span id="settingsArrow" style="margin-left:auto;font-size:12px;color:#999">&#9650;</span></div>
+  <div id="settingsBody">
+    <div class="settings-grid">
+      <div class="field">
+        <label>计算设备</label>
+        <select id="device"><option value="cuda" selected>CUDA (GPU)</option><option value="cpu">CPU</option></select>
+      </div>
+      <div class="field">
+        <label>语言</label>
+        <select id="language"><option value="zh" selected>中文</option><option value="en">英文</option><option value="">自动检测</option></select>
+      </div>
+      <div class="field">
+        <label>截图频率</label>
+        <select id="keyframeFrequency">
+          <option value="few">较少</option>
+          <option value="normal" selected>正常</option>
+          <option value="medium">中等</option>
+          <option value="many">较多</option>
+          <option value="all">全部</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>FFmpeg</label>
+        <input type="text" id="ffmpegPath" readonly style="background:#f0f0f0;color:#666" value="自动检测中...">
+      </div>
+    </div>
+    <div style="margin-top:14px">
+      <label style="font-size:12px;color:#888;font-weight:500;display:block;margin-bottom:6px">输出格式</label>
+      <div class="format-group">
+        <label><input type="checkbox" id="fmtMd" checked> Markdown</label>
+        <label><input type="checkbox" id="fmtJson"> JSON</label>
+        <label><input type="checkbox" id="fmtSrt"> SRT</label>
+        <label><input type="checkbox" id="fmtDocx"> Word</label>
+      </div>
+    </div>
+    <div style="margin-top:10px">
+      <div class="extra-opts">
+        <label><input type="checkbox" id="skipProcessed" checked> 跳过已处理文件</label>
+        <label><input type="checkbox" id="saveKeyframes" checked> 提取关键帧截图</label>
+        <label><input type="checkbox" id="trashSource" checked> 处理后移入回收站</label>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card actions">
+  <button class="btn btn-primary" id="enqueueBtn" onclick="enqueueTask()">&#43; 加入队列</button>
+  <button class="btn btn-success" id="startQueueBtn" onclick="startQueue()">&#9654; 开始队列</button>
+  <button class="btn btn-danger" id="stopBtn" onclick="stopTask()" disabled>&#9632; 停止</button>
+</div>
+
+<div class="card">
+  <div class="card-title" style="justify-content:space-between">
+    <span>&#128221; 任务队列</span>
+    <span id="queueSummary" style="font-size:12px;color:#999">0 项</span>
+  </div>
+  <ul class="queue-list" id="queueList">
+    <li class="queue-empty">队列为空，添加任务后点击"开始队列"</li>
+  </ul>
+</div>
+
+<div class="card progress-section" id="progressCard" style="display:none">
+  <div class="card-title">&#128200; 处理进度</div>
+  <div class="progress-info">
+    <span class="progress-file" id="progressFile">-</span>
+    <span class="progress-pct" id="progressPct">0%</span>
+  </div>
+  <div class="progress-bar-bg">
+    <div class="progress-bar-fill" id="progressFill"></div>
+  </div>
+  <div style="display:flex;justify-content:space-between;font-size:12px;color:#999;margin-top:6px">
+    <span id="progressDetail">就绪</span>
+    <span id="progressCount">0 / 0</span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title" style="justify-content:space-between">
+    <span>&#128203; 运行日志</span>
+    <span class="badge badge-idle" id="statusBadge">就绪</span>
+  </div>
+  <div class="log-box" id="logBox">
+    <div class="dim">准备就绪，点击"加入队列"添加任务...</div>
+  </div>
+</div>
+
+</div>
+
+<!-- 批量添加模态框 -->
+<div class="modal-overlay" id="batchModal">
+  <div class="modal">
+    <div class="modal-header">
+      <span>选择要添加的子文件夹</span>
+      <button class="close" onclick="closeBatchModal()">&times;</button>
+    </div>
+    <div class="modal-body" id="batchModalBody">
+      <div style="text-align:center;color:#999;padding:32px">加载中...</div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="closeBatchModal()">取消</button>
+      <button class="btn btn-primary" id="batchConfirmBtn" onclick="confirmBatch()" disabled>添加到队列</button>
+    </div>
+  </div>
+</div>
+
+<!-- hidden file/folder inputs -->
+<input type="file" id="filePicker" style="display:none" accept=".mp4,.mkv,.mov,.avi,.flv,.wmv,.webm,.ts,.mp3,.wav,.m4a,.aac,.flac,.ogg,.opus,.wma" onchange="onFilePicked(event)">
+<input type="file" id="folderPicker" style="display:none" webkitdirectory onchange="onFolderPicked(event)">
+
+<script>
+const logBox = document.getElementById('logBox');
+const enqueueBtn = document.getElementById('enqueueBtn');
+const startQueueBtn = document.getElementById('startQueueBtn');
+const stopBtn = document.getElementById('stopBtn');
+
+function toggleSettings(){
+  const body = document.getElementById('settingsBody');
+  const arrow = document.getElementById('settingsArrow');
+  if(body.style.display === 'none'){
+    body.style.display = '';
+    arrow.innerHTML = '&#9650;';
+  } else {
+    body.style.display = 'none';
+    arrow.innerHTML = '&#9660;';
+  }
+}
+
+function browseFile(){ document.getElementById('filePicker').click() }
+function browseFolder(){ document.getElementById('folderPicker').click() }
+function browseOutput(){
+  document.getElementById('outputPath').focus();
+  document.getElementById('folderPicker').click();
+}
+
+function onFilePicked(e){
+  const f = e.target.files[0];
+  if(f) document.getElementById('inputPath').value = f.path || f.name;
+  e.target.value = '';
+}
+
+function onFolderPicked(e){
+  const f = e.target.files[0];
+  if(f){
+    const dir = (f.path || f.name).replace(/\\[^\\]*$/, '');
+    const activeId = document.activeElement ? document.activeElement.id : '';
+    if(activeId === 'outputPath' || (document.getElementById('outputPath').value === '' && document.getElementById('inputPath').value !== '')){
+      document.getElementById('outputPath').value = dir;
+    } else {
+      document.getElementById('inputPath').value = dir;
+      if(!document.getElementById('outputPath').value) document.getElementById('outputPath').value = dir;
+    }
+  }
+  e.target.value = '';
+}
+
+function getConfig(){
+  return {
+    input: document.getElementById('inputPath').value.trim(),
+    output: document.getElementById('outputPath').value.trim(),
+    device: document.getElementById('device').value,
+    language: document.getElementById('language').value,
+    ffmpeg_path: document.getElementById('ffmpegPath').value.trim() || null,
+    keyframe_frequency: document.getElementById('keyframeFrequency').value,
+    save_keyframes: document.getElementById('saveKeyframes').checked,
+    skip_processed: document.getElementById('skipProcessed').checked,
+    fmt_md: document.getElementById('fmtMd').checked,
+    fmt_json: document.getElementById('fmtJson').checked,
+    fmt_srt: document.getElementById('fmtSrt').checked,
+    fmt_docx: document.getElementById('fmtDocx').checked,
+    trash_source: document.getElementById('trashSource').checked,
+  };
+}
+
+function appendLog(line){
+  const div = document.createElement('div');
+  const trimmed = line.trim();
+  if(!trimmed) return;
+  if(trimmed.startsWith('INFO:')) div.className = 'info';
+  else if(trimmed.startsWith('WARNING:')) div.className = 'warn';
+  else if(trimmed.startsWith('ERROR:')) div.className = 'error';
+  else if(trimmed.startsWith('[完成]')) div.className = 'success';
+  else if(trimmed.startsWith('[跳过]')) div.className = 'info';
+  else if(trimmed.startsWith('[失败]')) div.className = 'error';
+  else if(trimmed.startsWith('[错误]')) div.className = 'error';
+  div.textContent = trimmed;
+  logBox.appendChild(div);
+  logBox.scrollTop = logBox.scrollHeight;
+}
+
+function updateProgress(p){
+  const card = document.getElementById('progressCard');
+  if(p.queue_total > 0 || p.status === 'running' || p.status === 'completed'){
+    card.style.display = 'block';
+  }
+  document.getElementById('progressFile').textContent = p.current_file || '-';
+  document.getElementById('progressPct').textContent = (p.percentage || 0) + '%';
+  document.getElementById('progressFill').style.width = (p.percentage || 0) + '%';
+
+  const hasQueue = p.queue_total > 0;
+  const total = hasQueue ? p.queue_total : (p.total || 0);
+  const done = hasQueue ? p.queue_completed : (p.completed || 0);
+  document.getElementById('progressCount').textContent = done + ' / ' + total;
+
+  const detail = document.getElementById('progressDetail');
+  if(p.status === 'running') detail.textContent = p.current_file ? '正在处理...' : '准备中...';
+  else if(p.status === 'completed') detail.textContent = '&#9989; 全部完成';
+  else if(p.status === 'failed') detail.textContent = '&#10060; 处理出错';
+  else if(p.status === 'stopped') detail.textContent = '&#9209; 已手动停止';
+  else detail.textContent = '就绪';
+
+  const badge = document.getElementById('statusBadge');
+  badge.className = 'badge';
+  if(p.status === 'running' || p.processing){
+    badge.classList.add('badge-running');
+    badge.textContent = '运行中';
+  } else if(p.status === 'completed'){
+    badge.classList.add('badge-done');
+    badge.textContent = '已完成';
+  } else if(p.status === 'failed'){
+    badge.classList.add('badge-failed');
+    badge.textContent = '失败';
+  } else if(p.status === 'stopped'){
+    badge.classList.add('badge-stopped');
+    badge.textContent = '已停止';
+  } else {
+    badge.classList.add('badge-idle');
+    badge.textContent = '就绪';
+  }
+
+  const running = p.processing || p.status === 'running';
+  enqueueBtn.disabled = false;
+  startQueueBtn.disabled = running;
+  stopBtn.disabled = !running;
+}
+
+function updateQueue(q){
+  const list = document.getElementById('queueList');
+  const summary = document.getElementById('queueSummary');
+  const total = q.total || 0;
+  const done = q.completed || 0;
+  summary.textContent = done + '/' + total + ' 项';
+
+  if(total === 0){
+    list.innerHTML = '<li class="queue-empty">队列为空，添加任务后点击"开始队列"</li>';
+    return;
+  }
+
+  let html = '';
+  const statusMap = {pending:'等待中', running:'运行中', completed:'已完成', failed:'失败', stopped:'已停止'};
+  const badgeClass = {pending:'badge-idle', running:'badge-running', completed:'badge-done', failed:'badge-failed', stopped:'badge-stopped'};
+
+  for(let i = 0; i < q.items.length; i++){
+    const item = q.items[i];
+    const cls = item.status === 'running' ? 'queue-item running' : 'queue-item';
+    const canRemove = item.status === 'pending';
+    html += '<li class="' + cls + '">';
+    html += '<span class="q-idx">#' + item.id + '</span>';
+    html += '<span class="q-name" title="' + item.input + '">' + item.name + '</span>';
+    html += '<span class="q-status"><span class="badge ' + (badgeClass[item.status]||'badge-idle') + '">' + (statusMap[item.status]||item.status) + '</span></span>';
+    if(canRemove){
+      html += '<button class="q-remove" onclick="removeQueueItem(' + item.id + ')" title="移除">&#10005;</button>';
+    } else {
+      html += '<span class="q-remove" style="color:transparent">&#10005;</span>';
+    }
+    html += '</li>';
+  }
+  list.innerHTML = html;
+}
+
+async function fetchLogs(){
+  try{
+    const r = await fetch('/api/logs');
+    const d = await r.json();
+    if(d.logs) d.logs.forEach(l => appendLog(l));
+    updateProgress(d);
+  } catch(e){}
+}
+
+async function fetchQueue(){
+  try{
+    const r = await fetch('/api/queue');
+    const d = await r.json();
+    updateQueue(d);
+  } catch(e){}
+}
+
+async function enqueueTask(){
+  const cfg = getConfig();
+  if(!cfg.input){ alert('请选择输入路径'); return; }
+  try{
+    const r = await fetch('/api/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(cfg)
+    });
+    const d = await r.json();
+    if(d.error) alert('添加失败: ' + d.error);
+    else {
+      document.getElementById('inputPath').value = '';
+      document.getElementById('outputPath').value = '';
+      await fetchQueue();
+    }
+  } catch(e){ alert('添加失败: ' + e.message); }
+}
+
+async function startQueue(){
+  try{
+    const r = await fetch('/api/queue/start', {method: 'POST'});
+    const d = await r.json();
+    if(d.error) alert(d.error);
+    else {
+      logBox.innerHTML = '';
+      await fetchQueue();
+    }
+  } catch(e){ alert('启动失败: ' + e.message); }
+}
+
+async function stopTask(){
+  if(!confirm('确定要停止当前任务吗？')) return;
+  try{ await fetch('/api/stop', {method: 'POST'}); } catch(e){}
+}
+
+/* ---- 批量添加 ---- */
+let _batchDir = '';
+
+function browseBatch(){
+  const dir = document.getElementById('inputPath').value.trim();
+  if(!dir){ alert('请先在输入路径中填入父目录路径'); return; }
+  if(!document.getElementById('outputPath').value) document.getElementById('outputPath').value = dir;
+  openBatchModal(dir);
+}
+
+async function openBatchModal(dir){
+  _batchDir = dir;
+  const body = document.getElementById('batchModalBody');
+  body.innerHTML = '<div style="text-align:center;color:#999;padding:32px">扫描子文件夹...</div>';
+  document.getElementById('batchModal').classList.add('active');
+  document.getElementById('batchConfirmBtn').disabled = true;
+
+  try{
+    const r = await fetch('/api/scan-subdirs', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path: dir})
+    });
+    const d = await r.json();
+    if(d.error){ body.innerHTML = '<div style="text-align:center;color:#e8453c;padding:32px">' + d.error + '</div>'; return; }
+    if(!d.dirs || d.dirs.length === 0){ body.innerHTML = '<div style="text-align:center;color:#999;padding:32px">该目录下没有子文件夹</div>'; return; }
+
+    let html = '<label class="modal-select-all"><input type="checkbox" id="batchSelectAll" checked onchange="toggleBatchAll()"> 全选/反选</label>';
+    for(let i = 0; i < d.dirs.length; i++){
+      const sub = d.dirs[i];
+      html += '<label class="modal-subdir-item">';
+      html += '<input type="checkbox" class="batch-cb" checked data-path="' + sub.path.replace(/"/g,'&quot;') + '" data-name="' + sub.name.replace(/"/g,'&quot;') + '">';
+      html += '<span class="ms-name">' + sub.name + '</span>';
+      html += '<span class="ms-path" title="' + sub.path + '">' + sub.path + '</span>';
+      html += '</label>';
+    }
+    body.innerHTML = html;
+    document.getElementById('batchConfirmBtn').disabled = false;
+  } catch(e){
+    body.innerHTML = '<div style="text-align:center;color:#e8453c;padding:32px">加载失败: ' + e.message + '</div>';
+  }
+}
+
+function closeBatchModal(){
+  document.getElementById('batchModal').classList.remove('active');
+}
+
+function toggleBatchAll(){
+  const all = document.getElementById('batchSelectAll');
+  document.querySelectorAll('.batch-cb').forEach(cb => cb.checked = all.checked);
+}
+
+async function confirmBatch(){
+  const cbs = document.querySelectorAll('.batch-cb:checked');
+  if(cbs.length === 0){ alert('请至少选择一个文件夹'); return; }
+
+  document.getElementById('batchConfirmBtn').disabled = true;
+  const cfg = getConfig();
+  const items = [];
+  cbs.forEach(cb => {
+    const itemCfg = Object.assign({}, cfg);
+    itemCfg.input = cb.getAttribute('data-path');
+    itemCfg.output = cfg.output || _batchDir;
+    items.push(itemCfg);
+  });
+
+  try{
+    const r = await fetch('/api/batch-enqueue', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({items})
+    });
+    const d = await r.json();
+    if(d.errors && d.errors.length > 0){
+      alert('成功添加 ' + (d.added||[]).length + ' 项，' + d.errors.length + ' 项失败');
+    }
+    document.getElementById('inputPath').value = '';
+    document.getElementById('outputPath').value = '';
+    closeBatchModal();
+    await fetchQueue();
+  } catch(e){
+    alert('批量添加失败: ' + e.message);
+    document.getElementById('batchConfirmBtn').disabled = false;
+  }
+}
+
+async function removeQueueItem(id){
+  try{
+    const r = await fetch('/api/queue/remove', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id})
+    });
+    const d = await r.json();
+    if(d.error) alert(d.error);
+    else await fetchQueue();
+  } catch(e){ alert('移除失败: ' + e.message); }
+}
+
+async function fetchFfmpegPath(){
+  try{
+    const r = await fetch('/api/ffmpeg-path');
+    const d = await r.json();
+    if(d.path) document.getElementById('ffmpegPath').value = d.path;
+    else document.getElementById('ffmpegPath').value = '未检测到 ffmpeg';
+  } catch(e){
+    document.getElementById('ffmpegPath').value = '检测失败';
+  }
+}
+
+fetchFfmpegPath();
+fetchQueue();
+setInterval(fetchLogs, 2000);
+setInterval(fetchQueue, 3000);
+setTimeout(fetchLogs, 500);
+</script>
+</body>
+</html>
