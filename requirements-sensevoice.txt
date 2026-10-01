@@ -1,0 +1,5 @@
+# Install after the base requirements:
+# pip install -r requirements.txt -r requirements-sensevoice.txt
+funasr>=1.4.15,<2.0
+modelscope>=1.20.0
+kaldi-native-fbank>=1.22.3

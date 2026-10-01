@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -97,10 +98,7 @@ else:
 import numpy as np
 from PIL import Image
 
-try:
-    from faster_whisper import WhisperModel
-except ImportError:
-    WhisperModel = None
+from asr_backends import ASRBackend, ASRBackendError, create_backend
 
 
 class VideoProcessingError(Exception):
@@ -143,6 +141,66 @@ def get_keyframe_threshold(frequency: str) -> float:
     return mapping.get(frequency, 0.15)
 
 
+# Windows 文件名非法字符（含控制字符）——统一替换为下划线，
+# 另见 Naming Conventions: https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
+_INVALID_WIN_CHARS = '<>:"/\\|?*\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f' \
+    '\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f'
+
+
+def sanitize_stem(stem: str) -> str:
+    """清理文件名/目录名 stem，确保在 Windows 上与磁盘实际路径一致。
+
+    修复场景：
+    - 末尾空格/点号：Windows 创建文件/目录时静默去除，
+      导致 Python 侧的 `Path("a  ").exists()` 与磁盘真实状态脱节。
+    - Windows 非法字符：<> : " / \\ | ? * 以及控制字符。
+    - 清理后为空时回退为 md5 短哈希。
+    """
+    if stem is None:
+        stem = ""
+    # 1) 替换非法字符为下划线
+    cleaned = stem.translate({ord(c): "_" for c in _INVALID_WIN_CHARS})
+    # 2) 去掉末尾空格和点号（Windows 会静默去除，必须与磁盘一致）
+    cleaned = cleaned.rstrip(" .\t\r\n")
+    if cleaned:
+        return cleaned
+    # 3) 清理后为空，使用哈希兜底
+    return hashlib.md5(stem.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+
+def natural_key(text: str) -> list[object]:
+    """生成自然排序键：数字段按数值比较，其余按不区分大小写比较。
+
+    例如: "2" < "10"、"" < "01" < "02" < "10" < "a1" < "a2"。
+    re.split 的捕获分组保证同一索引位置上两个键的元素类型一致
+    （奇数位必为数字串、偶数位必为非数字串），因此列表比较不会
+    出现 int 与 str 混比抛 TypeError 的情况。
+    """
+    return [
+        int(part) if part.isdigit() else part.casefold()
+        for part in re.split(r"(\d+)", text)
+    ]
+
+
+def natural_sort_text_key(text: str) -> tuple[list[object], str]:
+    """带原文回退的自然排序键。
+
+    数字段相同时（如 "01" 与 "1"）按原文小写比较，保证排序结果
+    与输入顺序无关（确定性强，对顺序命名 + 跳过判断的一致性很重要）。
+    返回元组 (数字键, 原文)，两层比较类型各自一致，不会混比抛错。
+    """
+    return natural_key(text), text.casefold()
+
+
+def natural_sort_key(path: Path) -> list[tuple[list[object], str]]:
+    """按路径的每一段做自然排序，使 01/、02/、10/ 文件夹按数字序排列。
+
+    逐段比较能保证相同前缀的子路径聚集在一起（文件按所在目录分组），
+    与用户预期的"先按文件夹、再按文件夹内文件"的处理顺序一致。
+    """
+    return [natural_sort_text_key(part) for part in path.parts]
+
+
 class VideoTranscriber:
     # 支持的媒体扩展名（类常量，避免每次实例化都重建集合）
     VIDEO_EXTENSIONS = frozenset({".mp4", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".webm", ".ts"})
@@ -150,7 +208,8 @@ class VideoTranscriber:
 
     def __init__(
         self,
-        model_size: str = "faster-whisper-small",
+        model_size: str | None = None,
+        backend: str = "sensevoice",
         device: str = "cuda",
         language: str | None = "zh",
         save_keyframes: bool = True,
@@ -158,19 +217,22 @@ class VideoTranscriber:
         ffmpeg_path: str | None = None,
         exporter: object | None = None,
         output_formats: set[str] | None = None,
-        trash_source: bool = True,
+        trash_source: bool = False,
         vad_filter: bool = False,
         logger: logging.Logger | None = None,
         stop_event: threading.Event | None = None,
+        asr_backend: ASRBackend | None = None,
     ) -> None:
         """
         初始化视频转写器
         
         Args:
-            model_size: ASR 模型名称 (默认为 ParakeetTDT-0.6B-v3)
+            model_size: ASR 模型名称或本地目录；为空时使用后端默认模型
+            backend: ASR 后端名称（faster-whisper 或 sensevoice）
             device: 计算设备 (cuda 或 cpu)
             vad_filter: 是否开启 VAD 静音过滤（长静音视频可加速，但可能误删低音量语音）
             stop_event: 停止信号事件
+            asr_backend: 可选的已构造后端，主要用于依赖注入和测试
         """
         self.logger = logger or logging.getLogger(__name__)
         self.stop_event = stop_event
@@ -185,37 +247,27 @@ class VideoTranscriber:
             effective_formats.add("md")
         self.output_formats = effective_formats
         self.trash_source = trash_source
+        self.backend_name = backend
         self.model_size = model_size
         self.device = device
-        self.engine = "faster-whisper"
         
         # 记录关键路径以方便调试
         self.logger.info("环境检查: Python=%s, Device=%s", sys.version.split()[0], device)
         
-        # Only Faster Whisper model is supported
-        self.logger.info("Initializing Faster Whisper model (%s)...", model_size)
         try:
-            if WhisperModel is None:
-                raise VideoProcessingError(
-                    "faster-whisper not found. Please run `pip install -r requirements.txt` or `pip install -U faster-whisper`"
-                )
-
-            model_size_name = model_size.split("-")[-1] if "-" in model_size else "small"
-            
-            self._init_model(model_size_name)
-        except Exception as exc:
-            # GPU 初始化失败时自动回退到 CPU
-            if self.device == "cuda":
-                self.logger.warning("GPU 初始化失败 (%s)，自动回退到 CPU...", exc)
-                self.device = "cpu"
-                try:
-                    self._init_model(model_size_name)
-                except Exception as cpu_exc:
-                    raise VideoProcessingError(
-                        f"模型初始化失败 (GPU 和 CPU 均失败): {cpu_exc}"
-                    ) from cpu_exc
-            else:
-                raise VideoProcessingError(f"模型初始化失败: {exc}") from exc
+            self.asr_backend = asr_backend or create_backend(
+                backend=backend,
+                model_name=model_size,
+                device=device,
+                logger=self.logger,
+                stop_event=stop_event,
+            )
+        except ASRBackendError as exc:
+            raise VideoProcessingError(str(exc)) from exc
+        self.backend_name = self.asr_backend.name
+        self.model_size = self.asr_backend.model_name
+        self.device = self.asr_backend.device
+        self.engine = self.backend_name
         
         self.logger.info("模型加载完成")
         # video_extensions / audio_extensions 已提为类常量 VIDEO_EXTENSIONS / AUDIO_EXTENSIONS
@@ -263,20 +315,6 @@ class VideoTranscriber:
 
     def resolve_ffmpeg_path(self, ffmpeg_path: str | None) -> str:
         return self.resolve_ffmpeg_path_static(ffmpeg_path)
-
-    def _init_model(self, model_size_name: str) -> None:
-        requested_device = "cuda" if self.device == "cuda" else "cpu"
-        compute_type = "int8_float16" if requested_device == "cuda" else "int8"
-        self.model = WhisperModel(
-            model_size_name,
-            device=requested_device,
-            compute_type=compute_type,
-        )
-        self.logger.info(
-            "  Faster Whisper model loaded successfully (device: %s, compute_type: %s)",
-            requested_device,
-            compute_type,
-        )
 
     def requested_language(self) -> str | None:
         return self.language
@@ -376,8 +414,147 @@ class VideoTranscriber:
         
         self.logger.info(f"  扫描完成: 总文件数={total_files}, 媒体文件数={len(media_files)}, 所有扩展名={all_extensions}")
         
-        return sorted(media_files)
+        # 自然排序（01/、02/、10/ 文件夹按数字序；文件夹内 1、2、10 同理）
+        return sorted(media_files, key=natural_sort_key)
     
+    def _run_ffmpeg_audio(self, cmd: list[str], temp_path: Path, video_name: str) -> bytes:
+        """执行 ffmpeg 命令提取音频，返回读取到的 wav 数据（调用方负责删除临时文件）。"""
+        self.logger.info("  执行 ffmpeg 命令: %s", " ".join(cmd))
+        process = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            text=False,
+            timeout=3600,
+            check=False,
+            creationflags=NO_WINDOW,
+        )
+        if process.returncode != 0:
+            error_msg = process.stderr.decode("utf-8", errors="ignore").strip()
+            # 截断 ffmpeg 的巨量 AAC 解码错误，避免刷屏日志
+            if len(error_msg) > 600:
+                error_msg = error_msg[:600] + f"...（完整错误共 {len(error_msg)} 字符）"
+            raise AudioExtractionError(
+                f"ffmpeg 提取音频失败: {video_name}, 错误: {error_msg}"
+            )
+        if not temp_path.exists() or temp_path.stat().st_size == 0:
+            raise AudioExtractionError(f"音频提取结果为空: {video_name}")
+        with wave.open(str(temp_path), "rb") as wf:
+            return wf.readframes(wf.getnframes())
+
+    @staticmethod
+    def _safe_unlink(path: Path) -> None:
+        """静默删除临时文件，忽略文件不存在/被占用等错误。"""
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _standard_audio_cmd(self, video_path_str: str, out_path: Path) -> list[str]:
+        """标准音频提取命令（对正常文件无任何额外开销）。"""
+        return [
+            self.ffmpeg_path,
+            "-y",
+            "-i",
+            video_path_str,
+            "-f",
+            "wav",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-loglevel",
+            "error",
+            str(out_path),
+        ]
+
+    def _tolerant_audio_cmd(self, video_path_str: str, out_path: Path) -> list[str]:
+        """宽容模式：跳过损坏帧 + 单线程解码 + pan 强制单声道输出。"""
+        return [
+            self.ffmpeg_path,
+            "-y",
+            "-err_detect",
+            "ignore_err",
+            "-threads",
+            "1",
+            "-i",
+            video_path_str,
+            "-af",
+            "pan=mono|c0=c0",
+            "-ar",
+            "16000",
+            "-f",
+            "wav",
+            "-loglevel",
+            "error",
+            str(out_path),
+        ]
+
+    def _extract_audio_via_adts(self, video_path_str: str, temp_path: Path, video_name: str) -> bytes:
+        """最后补救：极端损坏的 AAC 流（常见于被改名成 .mp4 的 MPEG-TS 文件）直接解码时，
+        ffmpeg 8.x 解码器会把损坏帧误判为超大通道数（如 47/52 通道），导致自动重采样混流失败。
+        先将音频流原样复制为 ADTS（不解码，必然成功），再解码 ADTS 即可正常跳过损坏帧。
+        """
+        adts_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".aac", delete=False) as adts_handle:
+                adts_path = Path(adts_handle.name)
+
+            remux_cmd = [
+                self.ffmpeg_path,
+                "-y",
+                "-i",
+                video_path_str,
+                "-vn",
+                "-map",
+                "0:a:0",
+                "-c:a",
+                "copy",
+                "-f",
+                "adts",
+                "-loglevel",
+                "error",
+                str(adts_path),
+            ]
+            self.logger.info("  执行 ffmpeg 重封装命令: %s", " ".join(remux_cmd))
+            process = subprocess.run(
+                remux_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                text=False,
+                timeout=3600,
+                check=False,
+                creationflags=NO_WINDOW,
+            )
+            if process.returncode != 0 or not adts_path.exists() or adts_path.stat().st_size == 0:
+                raise AudioExtractionError(f"ADTS 重封装失败: {video_name}")
+
+            # 删除可能残留的 wav，再解码 ADTS 写入目标文件
+            self._safe_unlink(temp_path)
+            decode_cmd = [
+                self.ffmpeg_path,
+                "-y",
+                "-err_detect",
+                "ignore_err",
+                "-i",
+                str(adts_path),
+                "-f",
+                "wav",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-loglevel",
+                "error",
+                str(temp_path),
+            ]
+            return self._run_ffmpeg_audio(decode_cmd, temp_path, video_name)
+        finally:
+            if adts_path is not None:
+                self._safe_unlink(adts_path)
+
     def extract_audio(self, video_path: Path) -> np.ndarray[Any, Any]:
         """
         使用 ffmpeg 提取音频到内存，避免 PyAV 的编码问题。
@@ -398,46 +575,46 @@ class VideoTranscriber:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
                 temp_path = Path(handle.name)
 
-            cmd = [
-                self.ffmpeg_path,
-                "-y",
-                "-i",
-                video_path_str,
-                "-f",
-                "wav",
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-loglevel",
-                "error",
-                str(temp_path),
-            ]
-            self.logger.info("  执行 ffmpeg 命令: %s", " ".join(cmd))
             try:
-                process = subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    shell=False,
-                    text=False,
-                    timeout=3600,
-                    check=False,
-                    creationflags=NO_WINDOW,
-                )
-                if process.returncode != 0:
-                    error_msg = process.stderr.decode("utf-8", errors="ignore").strip()
-                    raise AudioExtractionError(f"ffmpeg 提取音频失败: {video_name}, 错误: {error_msg}")
-
-                if not temp_path.exists() or temp_path.stat().st_size == 0:
-                    raise AudioExtractionError(f"音频提取结果为空: {video_name}")
-                with wave.open(str(temp_path), "rb") as wf:
-                    audio_data = wf.readframes(wf.getnframes())
+                # 降级策略链：标准 → 宽容 → ADTS 重封装，全部失败时上报首次（最可读）错误
+                first_exc: AudioExtractionError | None = None
+                strategies = [
+                    ("标准参数", self._standard_audio_cmd),
+                    ("宽容模式", self._tolerant_audio_cmd),
+                ]
+                for label, build_cmd in strategies:
+                    self._safe_unlink(temp_path)
+                    try:
+                        audio_data = self._run_ffmpeg_audio(
+                            build_cmd(video_path_str, temp_path), temp_path, video_name
+                        )
+                        if label != "标准参数":
+                            self.logger.warning(
+                                "  %s提取成功（可能丢失少量损坏片段）: %s", label, video_name
+                            )
+                        break
+                    except AudioExtractionError as exc:
+                        if first_exc is None:
+                            first_exc = exc
+                        self.logger.warning("  %s解码失败，尝试更宽容的策略...", label)
+                else:
+                    # 最后补救：ADTS 重封装后再解码
+                    try:
+                        audio_data = self._extract_audio_via_adts(
+                            video_path_str, temp_path, video_name
+                        )
+                        self.logger.warning(
+                            "  通过 ADTS 重封装成功提取（可能丢失少量损坏片段）: %s", video_name
+                        )
+                    except AudioExtractionError:
+                        # 保留首次（更可读）的错误信息，避免多条超长日志叠加
+                        if first_exc is None:
+                            raise AudioExtractionError(
+                                f"音频提取失败: {video_name}（无可用解码策略）"
+                            )
+                        raise first_exc
             finally:
-                try:
-                    temp_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                self._safe_unlink(temp_path)
 
             audio_array = np.frombuffer(audio_data, dtype=np.int16)
             audio_array = audio_array.astype(np.float32) / 32768.0
@@ -452,91 +629,18 @@ class VideoTranscriber:
     def transcribe_audio(
         self, audio: np.ndarray[Any, Any], video_name: str
     ) -> tuple[list[SegmentDict], TranscriptionMetadata]:
-        """
-        Transcribe audio to text with timestamps.
-        """
+        """通过可插拔 ASR 后端将音频转换为带时间戳文本。"""
         try:
             self.logger.info("  Transcribing: %s", video_name)
             self.ensure_not_stopped()
-
-            # Calculate audio duration
-            duration_seconds = float(len(audio) / 16000.0)
-            self.logger.info("  Audio duration: %.2f seconds", duration_seconds)
-
-            # Only Faster Whisper model is supported
-            # Faster Whisper expects audio as a numpy array with shape (n,) and sample rate 16000
-            
-            # Split long audio into chunks to reduce memory usage
-            chunk_duration = 30
-            chunk_size = chunk_duration * 16000
-            total_chunks = max(1, (len(audio) + chunk_size - 1) // chunk_size)
-            
-            if total_chunks > 1:
-                self.logger.info("  Splitting audio into %d chunks to reduce memory usage", total_chunks)
-                raw_results = []
-                language = None
-                language_probability = 0.0
-                
-                for i in range(total_chunks):
-                    self.ensure_not_stopped()
-                    start_idx = i * chunk_size
-                    end_idx = min((i + 1) * chunk_size, len(audio))
-                    chunk_audio = audio[start_idx:end_idx]
-                    if len(chunk_audio) == 0:
-                        continue
-                    chunk_start_time = start_idx / 16000.0
-                    
-                    self.logger.info("  Processing chunk %d/%d (%.2f-%.2f seconds)", 
-                                  i + 1, total_chunks, chunk_start_time, chunk_start_time + len(chunk_audio)/16000.0)
-                    
-                    segments, info = self.model.transcribe(
-                        chunk_audio,
-                        language=self.requested_language(),
-                        beam_size=3,
-                        word_timestamps=False,
-                        vad_filter=self.vad_filter,
-                    )
-                    
-                    if i == 0:
-                        language = info.language
-                        language_probability = info.language_probability
-                    
-                    for segment in segments:
-                        segment_dict = {
-                            "text": segment.text,
-                            "start": segment.start + chunk_start_time,
-                            "end": segment.end + chunk_start_time,
-                        }
-                        raw_results.append(segment_dict)
-            else:
-                # Process as a single chunk
-                segments, info = self.model.transcribe(
-                    audio,
-                    language=self.requested_language(),
-                    beam_size=3,
-                    word_timestamps=False,
-                    vad_filter=self.vad_filter,
-                )
-                raw_results = []
-                for segment in segments:
-                    raw_results.append({
-                        "start": float(segment.start),
-                        "end": float(segment.end),
-                        "text": str(segment.text).strip(),
-                    })
-                language = info.language
-                language_probability = info.language_probability
-            
-            del audio
-            
-            metadata = {
-                "language": language,
-                "language_probability": language_probability,
-                "duration_seconds": duration_seconds,
-                "segment_count": len(raw_results),
-                "raw_segment_count": len(raw_results),
-                "language_mode": self.language or "auto",
-            }
+            result = self.asr_backend.transcribe(
+                audio,
+                language=self.requested_language(),
+                vad_filter=self.vad_filter,
+                media_name=video_name,
+            )
+            raw_results = result.segments
+            metadata = result.metadata
         except Exception as exc:
             raise TranscriptionError(f"Transcription failed: {video_name}: {exc}") from exc
 
@@ -613,7 +717,7 @@ class VideoTranscriber:
             return note_blocks
 
         try:
-            video_stem = video_path.stem
+            video_stem = sanitize_stem(video_path.stem)
         except Exception:
             video_stem = hashlib.md5(str(video_path).encode('utf-8')).hexdigest()
 
@@ -656,6 +760,7 @@ class VideoTranscriber:
                 return enriched_blocks
 
             # ── 第 3 步：帧差去重 ──
+            self.logger.info("  帧差去重前: candidates=%d, threshold=%.3f", len(candidates), self.keyframe_threshold)
             prev_arr = None
             deduped: list[tuple[float, Path]] = []
             for ts, fp in candidates:
@@ -664,12 +769,14 @@ class VideoTranscriber:
                         arr = np.array(img.convert('L').resize((100, 75)))
                     if prev_arr is not None:
                         diff = np.mean(np.abs(arr - prev_arr)) / 255.0
+                        self.logger.debug("    帧差 @ %.1fs: %.4f (阈值 %.3f)", ts, diff, self.keyframe_threshold)
                         if diff < self.keyframe_threshold:
                             continue
                     deduped.append((ts, fp))
                     prev_arr = arr
                 except Exception:
                     continue
+            self.logger.info("  帧差去重后: deduped=%d", len(deduped))
 
             if not deduped:
                 deduped = candidates[:1]
@@ -696,7 +803,16 @@ class VideoTranscriber:
                 if enriched_blocks[best].get("screenshot") is not None:
                     continue
                 dst = image_dir / f"{best + 1:03d}_{int(ts * 1000):09d}.jpg"
-                shutil.copy(src, dst)
+                try:
+                    shutil.copy(src, dst)
+                except OSError as e:
+                    self.logger.warning("  截图拷贝失败 ts=%.1fs dst=%s: %s", ts, dst, e)
+                    continue
+                # 显式校验文件已落盘：避免写入失败/目录实际不存在时，
+                # screenshot 字段变为悬空引用而后续 md 渲染阶段才报错
+                if not dst.exists():
+                    self.logger.warning("  截图未落盘 ts=%.1fs dst=%s，跳过分配", ts, dst)
+                    continue
                 enriched_blocks[best]["screenshot"] = os.path.relpath(
                     str(dst), str(output_path.parent)
                 ).replace("\\", "/")
@@ -845,21 +961,49 @@ class VideoTranscriber:
                 self.logger.error("权限错误: 无法写入 SRT 文件 %s。请检查文件夹权限。", output_path.name)
             raise OutputWriteError(f"SRT 写入失败: {output_path.name}: {exc}") from exc
 
-    def is_already_processed(self, media_path: Path, output_dir: Path) -> bool:
+    def build_output_stem(self, media_path: Path, seq_index: int | None = None, batch_total: int = 0) -> str:
+        """计算输出文件的基础名（md/json/srt/docx 共用，保证跳过判断一致）。
+
+        Args:
+            media_path: 音视频文件路径
+            seq_index: 批次内序号（1 起始）。目录批处理时传入，
+                       生成 "{固定宽度序号}_{原名}"；单文件处理传 None 保持原名。
+            batch_total: 批次总文件数，用于动态决定序号位数
+                         （保证 0999 < 1000 的排序正确）。
+
+        Returns:
+            清理后的输出基础名（不含扩展名）
+        """
+        try:
+            original = sanitize_stem(os.fsdecode(media_path.stem))
+        except Exception:
+            original = hashlib.md5(str(media_path).encode("utf-8", errors="ignore")).hexdigest()
+        if seq_index is None:
+            return original
+        width = max(3, len(str(batch_total)))
+        return f"{seq_index:0{width}d}_{original}"
+
+    def is_already_processed(self, media_path: Path, output_dir: Path, output_stem: str | None = None) -> bool:
         """
         检查视频是否已处理
         
         Args:
             media_path: 音视频文件路径
             output_dir: 输出目录
+            output_stem: 预期输出基础名（含序号前缀）。为 None 时按原名推导，
+                         与 process_media 的计算方式保持一致。
             
         Returns:
             如果已处理返回 True，否则返回 False
         """
-        md_path = output_dir / f"{media_path.stem}.md"
-        json_path = output_dir / f"{media_path.stem}.json"
-        srt_path = output_dir / f"{media_path.stem}.srt"
-        docx_path = output_dir / f"{media_path.stem}.docx"
+        try:
+            stem = output_stem if output_stem is not None else sanitize_stem(os.fsdecode(media_path.stem))
+        except Exception:
+            stem = hashlib.md5(str(media_path).encode('utf-8', errors='ignore')).hexdigest()
+        md_path = output_dir / f"{stem}.md"
+        json_path = output_dir / f"{stem}.json"
+        srt_path = output_dir / f"{stem}.srt"
+        docx_path = output_dir / f"{stem}.docx"
 
         required_paths: list[Path] = []
         if "md" in self.output_formats:
@@ -875,7 +1019,14 @@ class VideoTranscriber:
             return False
         return True
     
-    def process_media(self, media_path: Path, output_dir: Path, skip_processed: bool = True) -> bool:
+    def process_media(
+        self,
+        media_path: Path,
+        output_dir: Path,
+        skip_processed: bool = True,
+        seq_index: int | None = None,
+        batch_total: int = 0,
+    ) -> bool:
         """
         处理单个视频文件
         
@@ -883,6 +1034,10 @@ class VideoTranscriber:
             media_path: 音视频文件路径
             output_dir: 输出目录
             skip_processed: 是否跳过已处理的文件
+            seq_index: 批次内序号（1 起始）。目录批处理时传入，输出文件名为
+                       "{固定宽度序号}_{原名}.md"，保证按名称排序即处理顺序。
+                       单文件处理传 None，输出文件名保持原名。
+            batch_total: 批次总文件数，用于决定序号位数
             
         Returns:
             处理成功返回 True，失败返回 False
@@ -890,8 +1045,11 @@ class VideoTranscriber:
         # 安全处理媒体文件名，避免编码错误
         media_name = safe_name(media_path)
 
+        # 输出基础名只计算一次，跳过判断与各格式保存共用，避免命名不一致
+        output_stem = self.build_output_stem(media_path, seq_index, batch_total)
+
         # 检查是否已处理
-        if skip_processed and self.is_already_processed(media_path, output_dir):
+        if skip_processed and self.is_already_processed(media_path, output_dir, output_stem):
             self.logger.info("[跳过] %s (已处理)", media_name)
             return True
 
@@ -913,13 +1071,6 @@ class VideoTranscriber:
             if not results:
                 self.logger.warning("[警告] 转写结果为空: %s", media_name)
 
-            # 安全处理输出文件名，避免编码错误
-            try:
-                output_stem = os.fsdecode(media_path.stem)
-            except Exception:
-                import hashlib
-                output_stem = hashlib.md5(str(media_path).encode('utf-8', errors='ignore')).hexdigest()
-            
             md_path = output_dir / f"{output_stem}.md"
             json_path = output_dir / f"{output_stem}.json"
             srt_path = output_dir / f"{output_stem}.srt"
@@ -968,12 +1119,16 @@ class VideoTranscriber:
 
         self.logger.info("找到 %s 个音视频文件", len(media_files))
         success_count = 0
+        batch_total = len(media_files)
 
         for i, media_path in enumerate(media_files, 1):
             if self.stop_event and self.stop_event.is_set():
                 self.logger.info("收到停止信号，停止后续文件处理")
                 break
-            if self.process_media(media_path, output_path, skip_processed):
+            if self.process_media(
+                media_path, output_path, skip_processed,
+                seq_index=i, batch_total=batch_total,
+            ):
                 success_count += 1
             if progress_callback:
                 progress_callback(i, media_path.name)

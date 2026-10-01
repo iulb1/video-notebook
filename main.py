@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+import multiprocessing
+import queue
 import sys
 from pathlib import Path
 
-from video_transcriber import VideoTranscriber, get_keyframe_threshold
+from transcription_worker import run_worker_process
 
 
 LOGGER = logging.getLogger("video_notebook")
@@ -52,7 +54,7 @@ def configure_logging(verbose: bool) -> None:
 def build_parser() -> argparse.ArgumentParser:
     """构建命令行参数解析器。"""
     parser = argparse.ArgumentParser(
-        description="视频字幕转录工具 - 使用 Faster Whisper small 生成带时间戳的字幕",
+        description="视频字幕转录工具 - 使用可切换的本地 ASR 模型生成带时间戳字幕",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例用法:
@@ -77,11 +79,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory to store generated subtitle files",
     )
     parser.add_argument(
+        "--backend",
+        type=str,
+        default="sensevoice",
+        choices=["faster-whisper", "sensevoice"],
+        help="ASR backend (default: sensevoice)",
+    )
+    parser.add_argument(
         "--model",
         type=str,
-        default="faster-whisper-small",
-        choices=["faster-whisper-small"],
-        help="ASR model name (default: faster-whisper-small). Only Faster Whisper model is supported.",
+        default=None,
+        help="Model name or local model directory. Uses the backend default when omitted.",
     )
     parser.add_argument(
         "--device",
@@ -150,7 +158,8 @@ def log_runtime_summary(args: argparse.Namespace) -> None:
     LOGGER.info("=" * 60)
     LOGGER.info("Input directory: %s", args.input)
     LOGGER.info("Output directory: %s", args.output)
-    LOGGER.info("Model name: %s", args.model)
+    LOGGER.info("ASR backend: %s", args.backend)
+    LOGGER.info("Model name: %s", args.model or "backend default")
     LOGGER.info("Computing device: %s", args.device)
     LOGGER.info("Transcription language: %s", args.language or "auto-detect")
     LOGGER.info("FFmpeg path: %s", args.ffmpeg or "auto-detect from PATH/env")
@@ -176,24 +185,82 @@ def main() -> int:
 
         log_runtime_summary(args)
 
-        transcriber = VideoTranscriber(
-            model_size=args.model,
-            device=args.device,
-            language=args.language,
-            save_keyframes=not args.no_keyframes,
-            keyframe_threshold=get_keyframe_threshold(args.keyframe_frequency),
-            ffmpeg_path=args.ffmpeg,
-            exporter=build_exporter(not args.no_export_word, args.pandoc),
-            output_formats=parse_output_formats(not args.no_export_word),
-            trash_source=args.trash,
-            logger=LOGGER,
+        config = {
+            "input": args.input,
+            "output": args.output,
+            "backend": args.backend,
+            "model": args.model,
+            "device": args.device,
+            "language": args.language,
+            "ffmpeg_path": args.ffmpeg,
+            "pandoc_path": args.pandoc,
+            "save_keyframes": not args.no_keyframes,
+            "keyframe_frequency": args.keyframe_frequency,
+            "skip_processed": not args.no_skip,
+            "fmt_md": True,
+            "fmt_docx": not args.no_export_word,
+            "trash_source": args.trash,
+        }
+        context = multiprocessing.get_context("spawn")
+        event_queue = context.Queue()
+        stop_event = context.Event()
+        process = context.Process(
+            target=run_worker_process,
+            args=([{"task_id": 1, "config": config}], event_queue, stop_event),
+            name="video-notebook-worker",
         )
-        success = transcriber.process_path(
-            input_path=args.input,
-            output_dir=args.output,
-            skip_processed=not args.no_skip,
-        )
-        return 0 if success else 1
+        process.start()
+        result_status: str | None = None
+        worker_finished = False
+        dead_polls = 0
+        try:
+            while True:
+                try:
+                    event = event_queue.get(timeout=0.2)
+                except queue.Empty:
+                    if process.is_alive():
+                        dead_polls = 0
+                        continue
+                    dead_polls += 1
+                    if dead_polls >= 5:
+                        break
+                    continue
+                dead_polls = 0
+                event_type = event.get("type")
+                if event_type == "log":
+                    level = getattr(logging, event.get("level", "INFO"), logging.INFO)
+                    LOGGER.log(level, event.get("message", ""))
+                elif event_type == "progress":
+                    LOGGER.info(
+                        "Progress %s/%s: %s",
+                        event.get("current", 0),
+                        event.get("total", 0),
+                        event.get("file_name", ""),
+                    )
+                elif event_type == "task_result":
+                    result_status = event.get("status")
+                elif event_type == "finished":
+                    worker_finished = True
+                elif event_type == "fatal":
+                    LOGGER.error("Worker failed: %s", event.get("message", "unknown error"))
+            process.join(timeout=2)
+        except KeyboardInterrupt:
+            stop_event.set()
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2)
+            raise
+        finally:
+            event_queue.close()
+
+        if result_status == "completed" and worker_finished:
+            if process.exitcode not in (0, None):
+                LOGGER.warning("Worker exited abnormally after reporting success (code %s).", process.exitcode)
+            return 0
+        if process.exitcode not in (0, None):
+            LOGGER.error("Worker process exited with code %s.", process.exitcode)
+        return 130 if result_status == "stopped" else 1
     except KeyboardInterrupt:
         LOGGER.warning("User interrupted, program exited.")
         return 130

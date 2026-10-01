@@ -50,6 +50,7 @@ __pycache__/
 
 # Virtual environments
 venv/
+.venv/
 .venv312/
 .env/
 .env.local/
@@ -117,6 +118,7 @@ out/
 subtitles/
 subtitles_gui/
 local_output/
+test_output/
 
 # Test files
 Day01/audio_input_test/

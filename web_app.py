@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import faulthandler
 import logging
+import multiprocessing
 import os
 import queue
 import sys
@@ -15,13 +16,15 @@ faulthandler.enable()
 import flask
 from flask import Flask, jsonify, render_template, request
 
-from video_transcriber import VideoTranscriber, get_keyframe_threshold
-from document_exporter import DocumentExporter
+from asr_backends import ASRBackendError, normalize_backend_name, resolve_model_name
+from transcription_worker import run_worker_process
+from video_transcriber import VideoTranscriber, natural_sort_text_key
 
 app = Flask(__name__)
 
 worker_thread: threading.Thread | None = None
-stop_event = threading.Event()
+worker_process = None
+stop_event = None
 log_queue: queue.Queue[str] = queue.Queue()
 processing = False
 
@@ -32,8 +35,7 @@ _state_lock = threading.Lock()
 # 全局复用的转写器实例，避免每次队列处理都重新加载/销毁模型。
 # 关键：faster-whisper 模型在析构时会访问 CUDA 资源，可能触发段错误
 # 导致整个进程退出（faulthandler 检测到后直接终止）。保留全局引用可避免析构。
-_worker_transcriber: VideoTranscriber | None = None
-_worker_device: str = ""
+_worker_transcribers: dict[tuple[str, str, str], VideoTranscriber] = {}
 
 _task_id_counter = 0
 task_queue: list[dict] = []
@@ -91,10 +93,14 @@ def progress_callback(current: int, total: int, file_name: str):
 
 
 def build_config(data: dict) -> dict:
+    backend = normalize_backend_name(data.get("backend"))
+    model = resolve_model_name(backend, data.get("model"))
     return {
         "input": data.get("input", "").strip(),
         "output": data.get("output", "").strip(),
         "device": data.get("device", "cuda"),
+        "backend": backend,
+        "model": model,
         "language": data.get("language") or None,
         "ffmpeg_path": data.get("ffmpeg_path"),
         "save_keyframes": data.get("save_keyframes", True),
@@ -104,9 +110,36 @@ def build_config(data: dict) -> dict:
         "fmt_json": data.get("fmt_json", False),
         "fmt_srt": data.get("fmt_srt", False),
         "fmt_docx": data.get("fmt_docx", False),
-        "trash_source": data.get("trash_source", True),
+        "trash_source": data.get("trash_source", False),
         "vad_filter": data.get("vad_filter", False),
     }
+
+
+def model_key(config: dict) -> tuple[str, str, str]:
+    return (
+        config.get("backend", "sensevoice"),
+        config.get("model", "iic/SenseVoiceSmall"),
+        config.get("device", "cuda"),
+    )
+
+
+def queue_model_conflict(config: dict) -> bool:
+    requested = model_key(config)
+    return any(model_key(item["config"]) != requested for item in task_queue)
+
+
+def apply_runtime_config(tr: VideoTranscriber, cfg: dict, exporter, formats: set[str]) -> None:
+    tr.language = None if cfg.get("language") in (None, "", "auto") else cfg.get("language")
+    tr.save_keyframes = cfg.get("save_keyframes", True)
+    tr.keyframe_threshold = get_keyframe_threshold(cfg.get("keyframe_frequency", "normal"))
+    tr.ffmpeg_path = VideoTranscriber.resolve_ffmpeg_path_static(cfg.get("ffmpeg_path"))
+    tr.exporter = exporter
+    effective_formats = set(formats)
+    if "docx" in effective_formats:
+        effective_formats.add("md")
+    tr.output_formats = effective_formats
+    tr.trash_source = cfg.get("trash_source", False)
+    tr.vad_filter = cfg.get("vad_filter", False)
 
 
 def _run_single(tr: VideoTranscriber, config: dict) -> str:
@@ -137,8 +170,9 @@ def _dump_queue_state():
         pass
 
 
-def queue_worker():
-    global processing, progress, _worker_transcriber, _worker_device
+def _legacy_queue_worker():
+    global processing, progress
+    return
     tr: VideoTranscriber | None = None
     try:
         _queue_log.write_text("")
@@ -162,31 +196,18 @@ def queue_worker():
 
         exporter = DocumentExporter(pandoc_path=cfg.get("pandoc_path")) if cfg.get("fmt_docx") else None
 
-        requested_device = cfg.get("device", "cuda")
+        cache_key = model_key(cfg)
 
-        # 复用已有模型实例（device 相同），避免反复加载/销毁模型导致段错误退出
-        if _worker_transcriber is not None and _worker_device == requested_device:
-            tr = _worker_transcriber
-            # 运行时更新可变配置
-            tr.language = None if cfg.get("language") in (None, "", "auto") else cfg.get("language")
-            tr.save_keyframes = cfg.get("save_keyframes", True)
-            tr.keyframe_threshold = get_keyframe_threshold(cfg.get("keyframe_frequency", "normal"))
-            try:
-                tr.ffmpeg_path = VideoTranscriber.resolve_ffmpeg_path_static(cfg.get("ffmpeg_path"))
-            except Exception:
-                pass
-            tr.exporter = exporter
-            effective_formats = set(formats)
-            if "docx" in effective_formats:
-                effective_formats.add("md")
-            tr.output_formats = effective_formats
-            tr.trash_source = cfg.get("trash_source", False)
-            tr.vad_filter = cfg.get("vad_filter", False)
-            web_logger.info("复用已有的转写模型实例 (device=%s)", _worker_device)
+        # 按后端、模型和设备复用实例，保留引用以规避 CUDA 模型析构崩溃。
+        if cache_key in _worker_transcribers:
+            tr = _worker_transcribers[cache_key]
+            apply_runtime_config(tr, cfg, exporter, formats)
+            web_logger.info("复用已有 ASR 实例 (%s / %s / %s)", *cache_key)
         else:
             tr = VideoTranscriber(
-                model_size="faster-whisper-small",
-                device=requested_device,
+                model_size=cfg.get("model"),
+                backend=cfg.get("backend", "faster-whisper"),
+                device=cfg.get("device", "cuda"),
                 language=cfg.get("language"),
                 save_keyframes=cfg.get("save_keyframes", True),
                 keyframe_threshold=get_keyframe_threshold(cfg.get("keyframe_frequency", "normal")),
@@ -198,9 +219,10 @@ def queue_worker():
                 logger=web_logger,
                 stop_event=stop_event,
             )
-            _worker_transcriber = tr
-            _worker_device = tr.device
-            web_logger.info("创建新的转写模型实例 (device=%s)", _worker_device)
+            actual_key = (tr.backend_name, tr.model_size, tr.device)
+            _worker_transcribers[cache_key] = tr
+            _worker_transcribers.setdefault(actual_key, tr)
+            web_logger.info("创建新的 ASR 实例 (%s / %s / %s)", *actual_key)
 
         with _state_lock:
             pending_count = sum(1 for t in task_queue if t["status"] == "pending")
@@ -221,6 +243,23 @@ def queue_worker():
                 progress["completed"] = 0
             _dump_queue_state()
             web_logger.info("[队列] 开始处理 #%d: %s", item["id"], item["input"])
+
+            item_cfg = item["config"]
+            item_formats: set[str] = set()
+            for enabled, name in (
+                (item_cfg.get("fmt_md", True), "md"),
+                (item_cfg.get("fmt_json", False), "json"),
+                (item_cfg.get("fmt_srt", False), "srt"),
+                (item_cfg.get("fmt_docx", False), "docx"),
+            ):
+                if enabled:
+                    item_formats.add(name)
+            item_exporter = (
+                DocumentExporter(pandoc_path=item_cfg.get("pandoc_path"))
+                if item_cfg.get("fmt_docx")
+                else None
+            )
+            apply_runtime_config(tr, item_cfg, item_exporter, item_formats)
 
             result = _run_single(tr, item["config"])
             web_logger.info("[队列] #%d 处理完毕: %s", item["id"], result)
@@ -245,6 +284,106 @@ def queue_worker():
                 progress["status"] = "completed"
                 progress["percentage"] = 100
         web_logger.info("队列处理完毕")
+        _dump_queue_state()
+
+
+def queue_worker():
+    global processing, progress, worker_process, stop_event
+    context = multiprocessing.get_context("spawn")
+    event_queue = context.Queue()
+    local_stop_event = context.Event()
+    stop_event = local_stop_event
+    finished_message = False
+    try:
+        with _state_lock:
+            pending = [item for item in task_queue if item["status"] == "pending"]
+            jobs = [
+                {"task_id": item["id"], "config": dict(item["config"])}
+                for item in pending
+            ]
+            progress["queue_total"] = len(jobs)
+            progress["queue_completed"] = 0
+            progress["percentage"] = 0
+        if not jobs:
+            return
+
+        worker_process = context.Process(
+            target=run_worker_process,
+            args=(jobs, event_queue, local_stop_event),
+            name="video-notebook-worker",
+        )
+        worker_process.start()
+
+        dead_polls = 0
+        while True:
+            try:
+                event = event_queue.get(timeout=0.2)
+            except queue.Empty:
+                if worker_process.is_alive():
+                    dead_polls = 0
+                    continue
+                dead_polls += 1
+                if dead_polls >= 5:
+                    break
+                continue
+            dead_polls = 0
+            event_type = event.get("type")
+            if event_type == "log":
+                log_queue.put(event.get("message", ""))
+            elif event_type == "ready":
+                web_logger.info(
+                    "ASR 子进程已就绪 (%s / %s / %s)",
+                    event.get("backend"), event.get("model"), event.get("device"),
+                )
+            elif event_type == "task_started":
+                with _state_lock:
+                    item = next((item for item in task_queue if item["id"] == event["task_id"]), None)
+                    if item:
+                        item["status"] = "running"
+                    progress["status"] = "running"
+                    progress["current_file"] = event.get("file_name", "")
+                    progress["total"] = 0
+                    progress["completed"] = 0
+            elif event_type == "progress":
+                with _state_lock:
+                    progress["current_file"] = event.get("file_name", "")
+                    progress["total"] = event.get("total", 0)
+                    progress["completed"] = event.get("current", 0)
+            elif event_type == "task_result":
+                with _state_lock:
+                    item = next((item for item in task_queue if item["id"] == event["task_id"]), None)
+                    if item:
+                        item["status"] = event.get("status", "failed")
+                    progress["queue_completed"] += 1
+                    if progress["queue_total"]:
+                        progress["percentage"] = int(
+                            progress["queue_completed"] / progress["queue_total"] * 100
+                        )
+            elif event_type == "finished":
+                finished_message = True
+            elif event_type == "fatal":
+                web_logger.error("推理子进程失败: %s", event.get("message", "未知错误"))
+
+        worker_process.join(timeout=2)
+        if not finished_message:
+            web_logger.error("推理子进程意外退出，退出码: %s", worker_process.exitcode)
+            with _state_lock:
+                for item in task_queue:
+                    if item["status"] == "running":
+                        item["status"] = "failed"
+    except Exception as exc:
+        web_logger.error("队列监督线程异常: %s", exc)
+    finally:
+        with _state_lock:
+            processing = False
+            if progress["status"] != "stopped":
+                progress["status"] = "completed" if finished_message else "failed"
+                if finished_message:
+                    progress["percentage"] = 100
+        event_queue.close()
+        worker_process = None
+        stop_event = None
+        web_logger.info("队列处理结束")
         _dump_queue_state()
 
 
@@ -275,10 +414,15 @@ def api_start():
         if os.path.isfile(input_path):
             output_path = str(Path(input_path).parent)
 
-    config = build_config(data)
+    try:
+        config = build_config(data)
+    except ASRBackendError as exc:
+        return jsonify({"error": str(exc)}), 400
     config["output"] = output_path
 
     with _state_lock:
+        if queue_model_conflict(config):
+            return jsonify({"error": "当前队列已锁定其他模型，请先移除队列中的任务"}), 409
         _task_id_counter += 1
         item = {
             "id": _task_id_counter,
@@ -295,7 +439,7 @@ def api_start():
 
 @app.route("/api/queue/start", methods=["POST"])
 def api_queue_start():
-    global processing, worker_thread, stop_event
+    global processing, worker_thread
 
     with _state_lock:
         pending = [t for t in task_queue if t["status"] == "pending"]
@@ -307,7 +451,6 @@ def api_queue_start():
             return jsonify({"error": "队列已在运行"}), 400
 
         processing = True
-        stop_event.clear()
         progress["status"] = "running"
         progress["current_file"] = ""
         progress["total"] = pending_count
@@ -391,7 +534,8 @@ def api_scan_subdirs():
     except OSError as e:
         return jsonify({"error": f"扫描目录失败: {e}"}), 500
 
-    dirs.sort(key=lambda d: d["name"])
+    # 自然排序，与处理顺序保持一致（01、02、10）
+    dirs.sort(key=lambda d: natural_sort_text_key(d["name"]))
     return jsonify({"dirs": dirs})
 
 
@@ -414,15 +558,23 @@ def api_batch_enqueue():
             errors.append({"input": input_path, "error": "路径不存在"})
             continue
 
-        cfg = build_config(entry)
+        try:
+            cfg = build_config(entry)
+        except ASRBackendError as exc:
+            errors.append({"input": input_path, "error": str(exc)})
+            continue
         output_path = (entry.get("output") or "").strip()
         if not output_path:
-            output_path = input_path
+            # 批量添加默认：在各自的输入路径后追加 output 子目录
+            output_path = str(Path(input_path) / "output")
         cfg["output"] = output_path
         prepared.append((cfg, input_path))
 
     with _state_lock:
         for cfg, input_path in prepared:
+            if queue_model_conflict(cfg):
+                errors.append({"input": input_path, "error": "当前队列已锁定其他模型"})
+                continue
             _task_id_counter += 1
             item = {
                 "id": _task_id_counter,
@@ -451,7 +603,8 @@ def api_stop():
     global processing, progress
     with _state_lock:
         if processing:
-            stop_event.set()
+            if stop_event is not None:
+                stop_event.set()
             processing = False
             progress["status"] = "stopped"
 
@@ -459,6 +612,17 @@ def api_stop():
             if t["status"] == "running":
                 t["status"] = "stopped"
                 break
+
+    def terminate_after_grace():
+        process = worker_process
+        if process is None:
+            return
+        process.join(timeout=5)
+        if process.is_alive():
+            web_logger.warning("子进程未在 5 秒内停止，正在强制终止")
+            process.terminate()
+
+    threading.Thread(target=terminate_after_grace, daemon=True).start()
 
     return jsonify({"status": "stopped"})
 

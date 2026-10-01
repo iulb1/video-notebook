@@ -22,7 +22,9 @@
 
 ### 3.2 转录
 
-- 使用 Faster Whisper small 作为默认模型
+- 使用 SenseVoiceSmall 作为默认模型，Faster Whisper small 作为兼容选项
+- 支持在 Faster Whisper 与 SenseVoiceSmall 本地后端之间切换
+- 模型实现通过统一 ASR 接口与视频处理、字幕导出解耦
 - 支持自动语言检测
 - 允许手动指定语言，如 `zh`、`en`
 - 输出包含时间戳
@@ -68,6 +70,8 @@
 - `-i, --input`：输入文件或目录
 - `-o, --output`：输出目录
 - `--device`：`cuda` 或 `cpu`
+- `--backend`：`faster-whisper` 或 `sensevoice`
+- `--model`：可选模型名称或本地模型目录
 - `--language`：手动指定语言，不填时自动检测
 - `--ffmpeg`：可选，指定 ffmpeg 可执行文件路径
 - `--no-skip`：不跳过已处理文件
