@@ -68,14 +68,13 @@ def main() -> int:
     else:
         print(f"Python: {status['python']} ({status['executable']})")
         for name, available in status["modules"].items():
-            print(f"{'[OK]' if available else '[缺失]'} Python 模块: {name}")
-        print(f"{'[OK]' if status['ffmpeg'] else '[缺失]'} FFmpeg: {status['ffmpeg'] or 'PATH 中未找到'}")
-        print(f"{'[OK]' if status['pandoc'] else '[可选]'} Pandoc: {status['pandoc'] or '未安装，仅影响 Word 导出'}")
+            print(f"{'[OK]' if available else '[MISSING]'} Python module: {name}")
+        print(f"{'[OK]' if status['ffmpeg'] else '[MISSING]'} FFmpeg: {status['ffmpeg'] or 'not found on PATH'}")
+        print(f"{'[OK]' if status['pandoc'] else '[OPTIONAL]'} Pandoc: {status['pandoc'] or 'not installed (Word export only)'}")
         if args.device == "cuda":
-            print(f"{'[OK]' if status['cuda_available'] else '[失败]'} CUDA: {status['gpu'] or '不可用'}")
+            print(f"{'[OK]' if status['cuda_available'] else '[FAILED]'} CUDA: {status['gpu'] or 'unavailable'}")
     return 0 if status["ok"] else 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
